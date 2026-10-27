@@ -30,6 +30,20 @@ class VectorTileProvider private constructor(
     private val renderScale: Int,
     private val headers: Map<String, String>,
     private val fetchTile: (String) -> ByteArray?,
+    /**
+     * Answers from the device, at once: an offline package. Asked on the
+     * calling thread before a fetch is queued, so it never waits behind the
+     * network. Null for none.
+     */
+    private val localTile: ((String) -> ByteArray?)?,
+    /**
+     * How a source that is not on the device is fetched when the answer's
+     * validators are wanted -- the built-in HTTP when [fetchTile] is too.
+     * Null hands misses to [fetchTile].
+     */
+    private val missFetch: ConditionalFetch?,
+    /** How a kept source is asked about once stale. Null keeps it as it is. */
+    private val revalidate: ConditionalFetch?,
     cacheBytes: Int,
     private val diskCache: TileDiskCache?,
     private val glyphCache: StyleAssetCache?,
@@ -52,6 +66,15 @@ class VectorTileProvider private constructor(
     @Volatile
     var onGlyphsLoaded: (() -> Unit)? = null
 
+    /**
+     * Called when source tiles have arrived that tiles already drawn were
+     * missing -- they were drawn without them rather than kept waiting -- or
+     * when a kept source turned out to have changed. Both halves (ground and
+     * labels) are worth redrawing; the layer refetches.
+     */
+    @Volatile
+    var onSourcesLoaded: (() -> Unit)? = null
+
     private val gpuRenderCount =
         java.util.concurrent.atomic
             .AtomicLong()
@@ -69,7 +92,15 @@ class VectorTileProvider private constructor(
     val gpuRenders: Long get() = gpuRenderCount.get()
     val gpuFallbacks: Long get() = gpuFallbackCount.get()
 
-    private var sourceDiskCache: StyleAssetCache? = null
+    private var sourceDiskCache: SourceTileCache? = null
+    private var revalidator: SourceRevalidator? = null
+
+    /**
+     * The kept sources' change count, in every rendered tile's key: a tile
+     * drawn from a source that has since changed must stop being served.
+     */
+    @Volatile
+    private var sourceEpoch: Long = 0
 
     /**
      * Identifies the style for disk cache keys. Content-addressed, so a
@@ -147,8 +178,74 @@ class VectorTileProvider private constructor(
      * Source fetches under way, so the nine tiles that all want the same
      * neighbour share one download instead of racing nine.
      */
-    private val inFlight =
-        java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<ByteArray?>>()
+    private val inFlight = java.util.concurrent.ConcurrentHashMap<String, Flight>()
+
+    /** What became of one source: its bytes, or why there are none. */
+    private class SourceOutcome(
+        val bytes: ByteArray?,
+        /** Not an answer -- offline, or the fetch failed -- so not to be kept. */
+        val unavailable: Boolean = false,
+    )
+
+    /**
+     * One source being fetched, and who still wants it.
+     *
+     * A tile that is still waiting, or one drawn without it that wants to be
+     * redrawn when it lands, holds it. A tile the map gave up on lets go, and
+     * a fetch nobody holds by the time a thread reaches it is not made -- a
+     * fling abandons screens of tiles, and their downloads would otherwise
+     * still queue in front of the ones on screen.
+     */
+    private class Flight {
+        val result = java.util.concurrent.CompletableFuture<SourceOutcome>()
+        private var holders = 0
+        private var abandoned = false
+
+        @Synchronized
+        fun join(): Boolean {
+            if (abandoned) return false
+            holders++
+            return true
+        }
+
+        @Synchronized
+        fun leave() {
+            holders--
+        }
+
+        @Synchronized
+        fun abandonIfUnwanted(): Boolean {
+            if (holders > 0) return false
+            abandoned = true
+            return true
+        }
+    }
+
+    /** A source a tile is waiting on; [flight] is set while the tile holds a fetch. */
+    private class Pending(
+        val future: java.util.concurrent.CompletableFuture<SourceOutcome>,
+        val flight: Flight?,
+    )
+
+    /** Fetches drawn-short tiles are waiting on, so the handover can wait for quiet. */
+    private val awaitedSources =
+        java.util.concurrent.atomic
+            .AtomicInteger()
+
+    /** Set while a source handover is already scheduled, so a burst sends one. */
+    private val sourcesNotifyPending =
+        java.util.concurrent.atomic
+            .AtomicBoolean(false)
+
+    /** Whether a tile has been drawn short of sources since the last source handover. */
+    private val drawnShortSinceHandover =
+        java.util.concurrent.atomic
+            .AtomicBoolean(false)
+
+    /** Whether a kept source changed since the last source handover. */
+    private val sourcesChangedSinceHandover =
+        java.util.concurrent.atomic
+            .AtomicBoolean(false)
 
     /** Glyph fetches queued or running, so the notify can wait for quiet. */
     private val glyphsInFlight =
@@ -385,7 +482,22 @@ class VectorTileProvider private constructor(
         private const val STAT_CANCELLED = 4
         private const val STAT_QUEUE_MS = 5
         private const val STAT_BLOCKED = 6
-        private const val STAT_COUNT = 7
+        private const val STAT_LOCAL = 7
+        private const val STAT_COUNT = 8
+
+        /**
+         * How long a tile waits for sources that have to come over the network.
+         *
+         * Past this it is drawn with what it has and redrawn when the rest
+         * lands (see [onSourcesLoaded]). Waiting for all of them was right on
+         * a good network and wrong on a bad one: on a Wi-Fi that connects and
+         * then answers nothing, a fetch takes its full fifteen-second timeout,
+         * and every tile on screen waited for its slowest neighbour -- the
+         * map stayed white, the downloaded area included. On a good network
+         * a tile's sources are in long before this and nothing changes.
+         */
+        internal const val SOURCE_GRACE_MS: Long = 400
+        private const val AWAIT_SLICE_NANOS: Long = 50_000_000
 
         /**
          * The least grain the label overlay is drawn at, as a multiple of the
@@ -426,6 +538,15 @@ class VectorTileProvider private constructor(
          *   every tile; the geographic size of a tile does not change either way.
          * @param headers sent with every source tile request
          * @param fetchTile overrides fetching entirely; return null for "no tile"
+         * @param localTile answers from the device -- an offline package's
+         *   [OfflinePackage.Fetcher.local]. Asked first, on the calling thread,
+         *   so what is on the device is never queued behind the network.
+         * @param revalidate how a source kept in [diskCacheDir] is asked about
+         *   once stale (a day, or the server's `max-age`). It is drawn from the
+         *   cache either way; this only refreshes it. Defaults to plain HTTP
+         *   with [headers] when [fetchTile] is not given; with a [fetchTile]
+         *   and no [revalidate], kept sources are not asked about, because
+         *   asking would go around the fetch the app put in charge.
          * @throws IllegalArgumentException if the style cannot be parsed
          */
         @JvmStatic
@@ -440,6 +561,8 @@ class VectorTileProvider private constructor(
             renderMode: RenderMode = RenderMode.AUTO,
             renderScale: Int? = null,
             fetchTile: ((String) -> ByteArray?)? = null,
+            localTile: ((String) -> ByteArray?)? = null,
+            revalidate: ConditionalFetch? = null,
         ): VectorTileProvider {
             @Suppress("NAME_SHADOWING")
             val renderScale = (renderScale ?: displayRenderScale()).coerceAtLeast(1)
@@ -471,6 +594,9 @@ class VectorTileProvider private constructor(
                 renderScale = renderScale,
                 headers = headers,
                 fetchTile = fetchTile ?: { url -> httpGet(url, headers) },
+                localTile = localTile,
+                missFetch = if (fetchTile == null) httpSourceFetch(headers) else null,
+                revalidate = revalidate ?: if (fetchTile == null) httpSourceFetch(headers) else null,
                 cacheBytes = cacheBytes,
                 diskCache = diskCacheDir?.let { TileDiskCache(it, diskCacheBytes) },
                 glyphCache =
@@ -483,12 +609,7 @@ class VectorTileProvider private constructor(
                     },
                 styleJson = styleJson,
                 gpu = gpu,
-            ).apply {
-                sourceDiskCache =
-                    diskCacheDir?.let {
-                        StyleAssetCache(File(it, "sources"), DEFAULT_SOURCE_CACHE_BYTES)
-                    }
-            }
+            ).apply { attachSourceCache(diskCacheDir?.let { File(it, "sources") }) }
         }
 
         internal fun httpGet(
@@ -573,6 +694,28 @@ class VectorTileProvider private constructor(
         styleKey = TileDiskCache.digest(styleJson)
     }
 
+    /** Keeps fetched sources under [directory], asked about again once stale. */
+    private fun attachSourceCache(directory: File?) {
+        val store = directory?.let { SourceTileCache(it, DEFAULT_SOURCE_CACHE_BYTES) } ?: return
+        sourceDiskCache = store
+        sourceEpoch = store.epoch
+        revalidator =
+            revalidate?.let { fetch ->
+                SourceRevalidator(
+                    cache = store,
+                    fetch = fetch,
+                    onChanged = { url, bytes ->
+                        if (!closed) {
+                            cache.put(url, bytes)
+                            sourceEpoch = store.epoch
+                            sourcesChangedSinceHandover.set(true)
+                            onSourcesArrived()
+                        }
+                    },
+                )
+            }
+    }
+
     override fun renderTile(request: TileRequest): ByteArray? = renderTile(request) { false }
 
     override fun renderTile(
@@ -634,6 +777,9 @@ class VectorTileProvider private constructor(
                 // than the one that filled this cache must not serve its
                 // tiles.
                 "v${VectorTileRenderer.OUTPUT_VERSION}",
+                // Drawn from sources that may since have changed; see
+                // [SourceTileCache.epoch].
+                "src$sourceEpoch",
                 generation,
                 // Both halves are drawn at a scale the display chose, so a
                 // tile from one screen must never be served to another --
@@ -698,34 +844,46 @@ class VectorTileProvider private constructor(
                 java.util.concurrent.atomic
                     .AtomicLong()
             }
-        val pending = MutableList<java.util.concurrent.Future<ByteArray?>?>(urls.size) { null }
+        // What the device holds is answered here, on this thread; only what
+        // has to come over the network is queued. The order matters on a bad
+        // network: a package tile read behind thirty-two fetches that each
+        // time out after fifteen seconds is a white map for half a minute.
+        val pending = arrayOfNulls<Pending>(urls.size)
         urls.indices
             .sortedBy { index ->
                 val labelsOnly = plan.getJSONObject(index).optBoolean("labelsOnly", false)
                 if (labelsOnly) 1_000 + index else index
             }.forEach { index ->
-                val url = urls[index]
-                pending[index] =
-                    if (url == null) {
-                        java.util.concurrent.CompletableFuture
-                            .completedFuture(null)
-                    } else {
-                        val queued = System.nanoTime()
-                        sourceFetchers.submit<ByteArray?> {
-                            fetchStats[STAT_QUEUE_MS].addAndGet((System.nanoTime() - queued) / 1_000_000)
-                            if (closed) null else sourceTile(url, fetchStats)
-                        }
-                    }
+                val url = urls[index] ?: return@forEach
+                pending[index] = resolveSource(url, fetchStats)
             }
-        for (future in pending) {
-            if (isCancelled()) {
-                fetchStats[STAT_CANCELLED].addAndGet(pending.count { it?.cancel(false) == true }.toLong())
-                pending.forEach { it?.cancel(false) }
-                return null
-            }
-            tiles.add(runCatching { future?.get() }.getOrNull())
+        val outcomes = awaitSources(pending, fetchStarted + SOURCE_GRACE_MS * 1_000_000, isCancelled)
+        if (outcomes == null) {
+            fetchStats[STAT_CANCELLED].addAndGet(pending.count { it?.flight != null }.toLong())
+            pending.forEach { it?.flight?.leave() }
+            return null
         }
+        // Drawn now without the ones still on their way; they stay held, and
+        // the tile is redrawn when they land.
+        var stillComing = 0
+        for (index in pending.indices) {
+            val source = pending[index] ?: continue
+            if (outcomes[index] != null) {
+                source.flight?.leave()
+                continue
+            }
+            stillComing++
+            awaitedSources.incrementAndGet()
+            source.future.whenComplete { outcome, _ ->
+                source.flight?.leave()
+                awaitedSources.decrementAndGet()
+                if (outcome?.bytes != null) onSourcesArrived()
+            }
+        }
+        outcomes.forEach { tiles.add(it?.bytes) }
+        fetchStats[STAT_BLOCKED].addAndGet(outcomes.count { it?.unavailable == true }.toLong())
         val fetchMs = (System.nanoTime() - fetchStarted) / 1_000_000
+        if (stillComing > 0) drawnShortSinceHandover.set(true)
         if (closed) return null
 
         // Cached ranges belong in the store before the tile is judged to be
@@ -761,7 +919,9 @@ class VectorTileProvider private constructor(
         // A tile drawn while the network was off and a source was not in the
         // package is missing ink, like one drawn short of glyphs -- but
         // nothing will arrive to redraw it, so it must not be kept at all.
-        val drawnShortOfSources = fetchStats[STAT_BLOCKED].get() > 0
+        // Nor is one drawn before a slow source landed: it is about to be
+        // redrawn whole.
+        val drawnShortOfSources = fetchStats[STAT_BLOCKED].get() > 0 || stillComing > 0
         val keepGroundAs = if (drawnShortOfSources) null else groundKey
         val png =
             when (content) {
@@ -779,7 +939,8 @@ class VectorTileProvider private constructor(
                 "tile ${request.z}/${request.x}/${request.y} content=$content " +
                     "sources=${urls.count { it != null }} planned=${plan.length()} fetch=${fetchMs}ms " +
                     "render=${renderMs}ms bytes=${png?.size ?: 0} " +
-                    "mvt(mem=${fetchStats[STAT_MEMORY].get()} disk=${fetchStats[STAT_DISK].get()} " +
+                    "mvt(mem=${fetchStats[STAT_MEMORY].get()} local=${fetchStats[STAT_LOCAL].get()} " +
+                    "disk=${fetchStats[STAT_DISK].get()} coming=$stillComing " +
                     "net=${fetchStats[STAT_NETWORK].get()} shared=${fetchStats[STAT_SHARED].get()} " +
                     "blocked=${fetchStats[STAT_BLOCKED].get()} cancel=${fetchStats[STAT_CANCELLED].get()} " +
                     "queue=${fetchStats[STAT_QUEUE_MS].get()}ms)",
@@ -1026,10 +1187,36 @@ class VectorTileProvider private constructor(
         tiles: List<ByteArray?>,
     ): Boolean {
         if (glyphsUnavailable || closed) return false
-        val needed =
+        var needed =
             runCatching { renderer.neededGlyphs(request.z, request.x, request.y, tiles) }
                 .getOrElse { emptyList() }
         if (needed.isEmpty()) return false
+
+        // Ranges the device holds go in now, on this thread. Through the
+        // fetch threads they would wait behind ranges on their way over a
+        // network that may not be answering, and the tile would be drawn
+        // without labels it had all along.
+        val local = localTile
+        if (local != null) {
+            var added = 0
+            for (url in needed) {
+                if (!requestedGlyphs.add(url)) continue
+                val bytes = runCatching { local(url) }.getOrNull()
+                val count =
+                    if (bytes == null || bytes.isEmpty()) {
+                        0
+                    } else {
+                        runCatching { renderer.addGlyphs(bytes) }.getOrDefault(0)
+                    }
+                if (count > 0) added += count else requestedGlyphs.remove(url)
+            }
+            if (added > 0) {
+                needed =
+                    runCatching { renderer.neededGlyphs(request.z, request.x, request.y, tiles) }
+                        .getOrElse { emptyList() }
+                if (needed.isEmpty()) return false
+            }
+        }
 
         // Only the ranges nobody has claimed yet. Two tiles wanting the same
         // range at once would otherwise both fetch it.
@@ -1196,78 +1383,254 @@ class VectorTileProvider private constructor(
         return rasterizer.renderPng(tessellated, decorate) { closed || isCancelled() }
     }
 
+    /**
+     * One source's bytes, for code that wants them now (and for the tests
+     * that check two readers share one read).
+     */
     private fun sourceTile(
         url: String,
         stats: Array<java.util.concurrent.atomic.AtomicLong>,
     ): ByteArray? {
+        val source = resolveSource(url, stats)
+        return try {
+            runCatching { source.future.get() }.getOrNull()?.bytes
+        } finally {
+            source.flight?.leave()
+        }
+    }
+
+    /**
+     * Finds a source, or sets about fetching it.
+     *
+     * Memory, the device ([localTile]), then the disk cache, all on the
+     * calling thread and all before anything is queued: these take
+     * milliseconds, and putting them in the fetch pool put them behind
+     * fetches that, on a bad network, take fifteen seconds each. Only a
+     * source none of them has goes to [sourceFetchers].
+     *
+     * A source someone is already fetching is joined, not fetched again; the
+     * returned [Pending.flight] is then held, and has to be let go.
+     */
+    private fun resolveSource(
+        url: String,
+        stats: Array<java.util.concurrent.atomic.AtomicLong>,
+    ): Pending {
         cache.get(url)?.let {
             stats[STAT_MEMORY].incrementAndGet()
-            return it
+            return Pending(java.util.concurrent.CompletableFuture.completedFuture(SourceOutcome(it)), null)
         }
-        if (empties.contains(url)) return null
-        // Share disk reads as well as downloads. A cold memory cache lets
-        // neighbouring label tiles ask for the same file simultaneously.
-        val mine = java.util.concurrent.CompletableFuture<ByteArray?>()
-        val existing = inFlight.putIfAbsent(url, mine)
-        if (existing != null) {
-            stats[STAT_SHARED].incrementAndGet()
-            return runCatching { existing.get() }.getOrNull()
+        if (empties.contains(url)) {
+            return Pending(java.util.concurrent.CompletableFuture.completedFuture(SourceOutcome(null)), null)
         }
-        try {
-            // A prior flight may have filled memory between our initial
-            // lookup and claiming this URL. Recheck before doing any I/O.
-            val bytes =
-                cache.get(url)?.also {
-                    stats[STAT_MEMORY].incrementAndGet()
-                } ?: if (empties.contains(url)) {
-                    null
-                } else {
-                    sourceDiskCache?.get(url)?.also {
-                        stats[STAT_DISK].incrementAndGet()
-                        cache.put(url, it)
-                    } ?: fetchAndRemember(url, stats)
+        while (true) {
+            val existing = inFlight[url]
+            if (existing != null) {
+                if (existing.join()) {
+                    stats[STAT_SHARED].incrementAndGet()
+                    return Pending(existing.result, existing)
                 }
-            mine.complete(bytes)
-            return bytes
-        } catch (error: Throwable) {
-            mine.complete(null)
-            throw error
-        } finally {
-            inFlight.remove(url)
+                // Given up on by everyone just now; start again.
+                inFlight.remove(url, existing)
+                continue
+            }
+            val mine = Flight()
+            mine.join()
+            if (inFlight.putIfAbsent(url, mine) != null) continue
+            val local =
+                try {
+                    localSource(url, stats)
+                } catch (error: Throwable) {
+                    inFlight.remove(url, mine)
+                    mine.result.complete(SourceOutcome(null, unavailable = true))
+                    throw error
+                }
+            if (local != null) {
+                // Shared reads: a cold memory cache lets neighbouring tiles
+                // ask for the same file at once, and they all get this one.
+                inFlight.remove(url, mine)
+                mine.result.complete(local)
+                mine.leave()
+                return Pending(mine.result, null)
+            }
+            val queued = System.nanoTime()
+            try {
+                sourceFetchers.execute {
+                    stats[STAT_QUEUE_MS].addAndGet((System.nanoTime() - queued) / 1_000_000)
+                    fetchSource(url, mine, stats)
+                }
+            } catch (_: java.util.concurrent.RejectedExecutionException) {
+                inFlight.remove(url, mine)
+                mine.result.complete(SourceOutcome(null, unavailable = true))
+            }
+            return Pending(mine.result, mine)
         }
+    }
+
+    /** What the device can say about [url] without the network, or null. */
+    private fun localSource(
+        url: String,
+        stats: Array<java.util.concurrent.atomic.AtomicLong>,
+    ): SourceOutcome? {
+        // A prior flight may have filled memory between the first lookup and
+        // claiming this URL.
+        cache.get(url)?.let {
+            stats[STAT_MEMORY].incrementAndGet()
+            return SourceOutcome(it)
+        }
+        if (empties.contains(url)) return SourceOutcome(null)
+        // The package before the cache: it is what was asked for, and it is
+        // never asked about again. Kept in memory only -- it is on disk
+        // already.
+        localTile?.invoke(url)?.takeIf { it.isNotEmpty() }?.let {
+            stats[STAT_LOCAL].incrementAndGet()
+            cache.put(url, it)
+            return SourceOutcome(it)
+        }
+        val kept = sourceDiskCache?.get(url) ?: return null
+        stats[STAT_DISK].incrementAndGet()
+        cache.put(url, kept.bytes)
+        // Drawn now, asked about in the background.
+        revalidator?.revalidate(url, kept)
+        return SourceOutcome(kept.bytes)
+    }
+
+    /** The network half of [resolveSource], on a fetch thread. */
+    private fun fetchSource(
+        url: String,
+        flight: Flight,
+        stats: Array<java.util.concurrent.atomic.AtomicLong>,
+    ) {
+        // Nobody wants it any more: the map moved on before a thread got here.
+        if (closed || flight.abandonIfUnwanted()) {
+            inFlight.remove(url, flight)
+            flight.result.complete(SourceOutcome(null, unavailable = true))
+            return
+        }
+        val outcome =
+            try {
+                fetchAndRemember(url, stats)
+            } catch (error: Throwable) {
+                SourceOutcome(null, unavailable = true)
+            }
+        inFlight.remove(url, flight)
+        flight.result.complete(outcome)
     }
 
     private fun fetchAndRemember(
         url: String,
         stats: Array<java.util.concurrent.atomic.AtomicLong>,
-    ): ByteArray? {
+    ): SourceOutcome {
         // A source that answers "no tile here" is remembered, because it will
         // answer the same way tomorrow. A source that fails to answer is not:
         // treating a dropped connection as an empty tile leaves a hole in the
         // map for as long as the app runs, and the hole is invisible from
         // here -- the tile simply draws without that data.
         stats[STAT_NETWORK].incrementAndGet()
-        val fetched = runCatching { fetchTile(url) }
-        val bytes = fetched.getOrNull()
-        if (bytes == null) {
-            if (fetched.exceptionOrNull() is OfflineUnavailableException) {
-                // Not an error and not an answer: the network is off. The
-                // tile is drawn without this source and not kept, so it is
-                // drawn again once the network is back.
-                stats[STAT_BLOCKED].incrementAndGet()
-            } else if (fetched.isSuccess) {
-                empties.add(url)
-            } else {
-                // A network failure is the same for the tile: drawn without
-                // this source, not kept, tried again next time.
-                stats[STAT_BLOCKED].incrementAndGet()
-                Log.w(TAG, "source tile failed; will try again: $url", fetched.exceptionOrNull())
+        val fetched =
+            runCatching {
+                // The built-in fetch keeps what the server said about the
+                // tile, so it can be asked about rather than downloaded again.
+                missFetch?.fetch(url, null, null) ?: SourceResponse(fetchTile(url))
             }
-            return null
+        val response = fetched.getOrNull()
+        val bytes = response?.bytes
+        if (bytes == null) {
+            val error = fetched.exceptionOrNull()
+            if (error == null) {
+                empties.add(url)
+                return SourceOutcome(null)
+            }
+            // Not an answer: the network is off (offline with a package), or
+            // failed. The tile is drawn without this source and not kept, so
+            // it is drawn again once the network is back.
+            if (error !is OfflineUnavailableException) {
+                Log.w(TAG, "source tile failed; will try again: $url", error)
+            }
+            return SourceOutcome(null, unavailable = true)
         }
         cache.put(url, bytes)
-        sourceDiskCache?.put(url, bytes)
-        return bytes
+        sourceDiskCache?.put(url, bytes, response.etag, response.lastModified, response.maxAgeSeconds)
+        return SourceOutcome(bytes)
+    }
+
+    /**
+     * Waits for a tile's sources until [deadlineNanos], and no longer.
+     *
+     * Returns each source's outcome, null for one still on its way; or null
+     * altogether when the tile was cancelled. Polls in slices so a tile the
+     * map gave up on stops waiting promptly.
+     */
+    private fun awaitSources(
+        pending: Array<Pending?>,
+        deadlineNanos: Long,
+        isCancelled: () -> Boolean,
+    ): Array<SourceOutcome?>? {
+        val outcomes = arrayOfNulls<SourceOutcome>(pending.size)
+        for (index in pending.indices) {
+            val future = pending[index]?.future ?: continue
+            while (true) {
+                if (closed || isCancelled()) return null
+                if (future.isDone) {
+                    outcomes[index] = runCatching { future.get() }.getOrElse { SourceOutcome(null, unavailable = true) }
+                    break
+                }
+                val remaining = deadlineNanos - System.nanoTime()
+                if (remaining <= 0) break
+                try {
+                    outcomes[index] =
+                        future.get(
+                            minOf(remaining, AWAIT_SLICE_NANOS),
+                            java.util.concurrent.TimeUnit.NANOSECONDS,
+                        )
+                    break
+                } catch (_: java.util.concurrent.TimeoutException) {
+                } catch (_: Exception) {
+                    outcomes[index] = SourceOutcome(null, unavailable = true)
+                    break
+                }
+            }
+        }
+        return outcomes
+    }
+
+    /**
+     * Tells the layer that tiles drawn before now were missing sources that
+     * have since arrived, or were drawn from sources that have changed.
+     *
+     * Coalesced like [onGlyphsArrived], for the same reason: sources land in
+     * bursts, and a refetch per arrival would redraw the screen over and over
+     * to reach one picture. The window is held while sources drawn-short tiles
+     * are waiting on are still in flight, up to a cap, so a bad network does
+     * not turn into a redraw every few hundred milliseconds.
+     */
+    private fun onSourcesArrived() {
+        if (!sourcesNotifyPending.compareAndSet(false, true)) return
+        val waiter =
+            Thread {
+                val deadline = System.nanoTime() + glyphNotifyMaxWaitMs * 1_000_000L
+                try {
+                    Thread.sleep(glyphNotifyQuietMs)
+                    while (awaitedSources.get() > 0 && System.nanoTime() < deadline && !closed) {
+                        Thread.sleep(glyphNotifyQuietMs)
+                    }
+                } catch (_: InterruptedException) {
+                    sourcesNotifyPending.set(false)
+                    return@Thread
+                }
+                sourcesNotifyPending.set(false)
+                if (closed) return@Thread
+                val short = drawnShortSinceHandover.getAndSet(false)
+                val changed = sourcesChangedSinceHandover.getAndSet(false)
+                if (!short && !changed) return@Thread
+                if (Log.isLoggable(TAG, Log.DEBUG)) {
+                    Log.d(TAG, "sources arrived (short=$short changed=$changed); tiles hand over")
+                }
+                runCatching { onSourcesLoaded?.invoke() }
+                    .onFailure { Log.w(TAG, "source notification failed", it) }
+            }
+        waiter.isDaemon = true
+        waiter.name = "mc-source-notify"
+        waiter.start()
     }
 
     private val closeStarted =
@@ -1278,6 +1641,8 @@ class VectorTileProvider private constructor(
         if (!closeStarted.compareAndSet(false, true)) return false
         closed = true
         onGlyphsLoaded = null
+        onSourcesLoaded = null
+        revalidator?.close()
         glyphFetchers.shutdownNow().forEach { (it as? java.util.concurrent.Future<*>)?.cancel(false) }
         sourceFetchers.shutdownNow().forEach { (it as? java.util.concurrent.Future<*>)?.cancel(false) }
         return true

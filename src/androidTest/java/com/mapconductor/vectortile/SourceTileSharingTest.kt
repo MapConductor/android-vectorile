@@ -42,7 +42,7 @@ class SourceTileSharingTest {
                                 "sourceTile", String::class.java, Array<AtomicLong>::class.java,
                             ).apply { isAccessible = true }
                     val barrier = CyclicBarrier(16)
-                    val stats = Array(7) { AtomicLong() }
+                    val stats = Array(8) { AtomicLong() }
                     val pending =
                         (0 until 16).map {
                             workers.submit<ByteArray?> {
