@@ -250,6 +250,7 @@ fun MapViewScope.VectorTileLayer(
                     upstream = { url -> VectorTileProvider.httpGet(url, headers) },
                     online = online,
                     onStats = { stats -> mainHandler.post { statsListener?.invoke(stats) } },
+                    conditionalUpstream = httpSourceFetch(headers),
                 )
             }
         }
@@ -274,6 +275,12 @@ fun MapViewScope.VectorTileLayer(
     // Bumped when glyphs land. The map only refetches a raster source whose
     // URL changed, so the generation has to reach the template.
     var glyphGeneration by remember { mutableIntStateOf(0) }
+
+    // Bumped when sources land that tiles were drawn without -- on a slow
+    // network a tile is drawn with what it has rather than kept waiting -- or
+    // when a kept source changed. Both halves were drawn from them, so both
+    // are handed over.
+    var sourceGeneration by remember { mutableIntStateOf(0) }
     var failure by remember { mutableStateOf<String?>(null) }
 
     DisposableEffect(groupId, tileSize) {
@@ -297,6 +304,12 @@ fun MapViewScope.VectorTileLayer(
                         renderMode = renderMode,
                         renderScale = renderScale,
                         fetchTile = fetcher,
+                        // The package is read on the asking thread, never
+                        // queued behind the network; and what was kept from
+                        // the network is asked about through the fetcher, so
+                        // offline means not asked.
+                        localTile = fetcher?.let { pkgFetcher -> { url: String -> pkgFetcher.local(url) } },
+                        revalidate = fetcher?.revalidation,
                     )
                 }
             }
@@ -306,6 +319,10 @@ fun MapViewScope.VectorTileLayer(
                 // round trip and a tile at low zoom wants dozens, so tiles are
                 // drawn with whatever is loaded and refetched once more is.
                 it.onGlyphsLoaded = { glyphGeneration++ }
+                it.onSourcesLoaded = {
+                    sourceGeneration++
+                    glyphGeneration++
+                }
                 // Two routes from one provider: the ground and the labels are
                 // served as separate tile layers stacked on each other. The
                 // user sees one map; the halves render in parallel -- GPU
@@ -357,34 +374,54 @@ fun MapViewScope.VectorTileLayer(
 
     /**
      * The ground: geometry only, drawn by the GPU, never invalidated by
-     * glyphs. One layer, mounted once, at the bottom.
+     * glyphs. At the bottom; replaced only when sources it was drawn without
+     * arrive, and then handed over like the labels.
+     *
+     * `credits` keys the mounted list so that swapping the style to one with
+     * different sources re-credits the map. Two styles with the same credits
+     * compare equal and the layer is left alone, which is the ordinary case
+     * -- a recolour keeps its data.
+     *
+     * `styleKey` is a key for the opposite reason: the same data drawn
+     * differently. A map refetches a raster source whose URL changed and not
+     * otherwise, so a restyle has to reach the template -- without it the
+     * tiles with the buildings still on them are served forever.
      */
-    val ground =
-        // `credits` is a key so that swapping the style to one with different
-        // sources re-credits the map. Two styles with the same credits compare
-        // equal and the layer is left alone, which is the ordinary case -- a
-        // recolour keeps its data.
-        //
-        // `styleKey` is a key for the opposite reason: the same data drawn
-        // differently. A map refetches a raster source whose URL changed and
-        // not otherwise, so a restyle has to reach the template -- without it
-        // the tiles with the buildings still on them are served forever.
+    fun groundStateFor(generation: Int) =
+        RasterLayerState(
+            id = "$groupId-geom-$styleKey-s$generation",
+            source =
+                RasterLayerSource.UrlTemplate(
+                    template = tileServer.urlTemplate("$groupId-geom", tileSize, "$styleKey-s$generation"),
+                    tileSize = declaredTileSize,
+                    maxZoom = maxZoom,
+                    attributionRules = credits,
+                    scheme = TileScheme.XYZ,
+                ),
+            opacity = opacity.coerceIn(0.0f, 1.0f),
+            visible = visible,
+            // Every generation at the same level. A rising index would, some
+            // hundred handovers in, lift the ground over the app's own layers
+            // and the labels; both generations draw the same map, so which of
+            // the two is on top for the moment of a handover does not show.
+            zIndex = 0,
+        )
+
+    val mountedGround =
         remember(groupId, tileSize, declaredTileSize, credits, styleKey) {
-            RasterLayerState(
-                id = "$groupId-geom",
-                source =
-                    RasterLayerSource.UrlTemplate(
-                        template = tileServer.urlTemplate("$groupId-geom", tileSize, styleKey),
-                        tileSize = declaredTileSize,
-                        maxZoom = maxZoom,
-                        attributionRules = credits,
-                        scheme = TileScheme.XYZ,
-                    ),
-                opacity = opacity.coerceIn(0.0f, 1.0f),
-                visible = visible,
-                zIndex = 0,
-            )
+            mutableStateListOf(groundStateFor(sourceGeneration))
         }
+
+    LaunchedEffect(sourceGeneration) {
+        if (mountedGround.lastOrNull()?.id == groundStateFor(sourceGeneration).id) return@LaunchedEffect
+        // Alongside, then the old one goes once the new one's tiles have had
+        // time to arrive -- removing first would leave the map bare.
+        mountedGround.add(groundStateFor(sourceGeneration))
+        kotlinx.coroutines.delay(HANDOVER_MS)
+        while (mountedGround.size > 1) {
+            mountedGround.removeAt(0)
+        }
+    }
 
     /**
      * The label overlays currently mounted: normally one, briefly two.
@@ -434,8 +471,10 @@ fun MapViewScope.VectorTileLayer(
     }
 
     LaunchedEffect(opacity, visible) {
-        ground.opacity = opacity.coerceIn(0.0f, 1.0f)
-        ground.visible = visible
+        mountedGround.forEach {
+            it.opacity = opacity.coerceIn(0.0f, 1.0f)
+            it.visible = visible
+        }
         mounted.forEach {
             it.opacity = opacity.coerceIn(0.0f, 1.0f)
             it.visible = visible
@@ -446,7 +485,7 @@ fun MapViewScope.VectorTileLayer(
     // mounted, and makes the dependency explicit rather than incidental.
     LaunchedEffect(current) { }
 
-    RasterLayer(state = ground)
+    mountedGround.forEach { RasterLayer(state = it) }
     mounted.forEach { RasterLayer(state = it) }
 }
 

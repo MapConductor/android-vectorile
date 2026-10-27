@@ -1,3 +1,10 @@
+public interface com.mapconductor.vectortile.ConditionalFetch {
+  public abstract com.mapconductor.vectortile.SourceResponse fetch(java.lang.String, java.lang.String, java.lang.String);
+}
+public final class com.mapconductor.vectortile.ConditionalFetchKt {
+  public static final com.mapconductor.vectortile.ConditionalFetch httpSourceFetch(java.util.Map<java.lang.String, java.lang.String>);
+  public static final java.lang.Long parseMaxAge(java.lang.String);
+}
 public final class com.mapconductor.vectortile.EglOffscreen implements java.io.Closeable {
   public static final com.mapconductor.vectortile.EglOffscreen$Companion Companion;
   public final int getEsVersion();
@@ -101,6 +108,8 @@ public final class com.mapconductor.vectortile.OfflinePackage$Fetcher implements
   public final boolean getOnline();
   public final void setOnline(boolean);
   public final com.mapconductor.vectortile.OfflinePackage$Stats getStats();
+  public final byte[] local(java.lang.String);
+  public final com.mapconductor.vectortile.ConditionalFetch getRevalidation();
   public byte[] invoke(java.lang.String);
   public java.lang.Object invoke(java.lang.Object);
 }
@@ -203,6 +212,45 @@ public final class com.mapconductor.vectortile.SolidBatchRenderer$Batch {
 }
 public final class com.mapconductor.vectortile.SolidBatchRenderer$Companion {
 }
+public final class com.mapconductor.vectortile.SourceResponse {
+  public com.mapconductor.vectortile.SourceResponse(byte[], boolean, java.lang.String, java.lang.String, java.lang.Long);
+  public com.mapconductor.vectortile.SourceResponse(byte[], boolean, java.lang.String, java.lang.String, java.lang.Long, int, kotlin.jvm.internal.DefaultConstructorMarker);
+  public final byte[] getBytes();
+  public final boolean getNotModified();
+  public final java.lang.String getEtag();
+  public final java.lang.String getLastModified();
+  public final java.lang.Long getMaxAgeSeconds();
+}
+public final class com.mapconductor.vectortile.SourceRevalidator implements java.io.Closeable {
+  public static final com.mapconductor.vectortile.SourceRevalidator$Companion Companion;
+  public static final int DEFAULT_THREADS;
+  public static final int DEFAULT_QUEUE;
+  public com.mapconductor.vectortile.SourceRevalidator(com.mapconductor.vectortile.SourceTileCache, com.mapconductor.vectortile.ConditionalFetch, kotlin.jvm.functions.Function2<? super java.lang.String, ? super byte[], kotlin.Unit>, int, int);
+  public com.mapconductor.vectortile.SourceRevalidator(com.mapconductor.vectortile.SourceTileCache, com.mapconductor.vectortile.ConditionalFetch, kotlin.jvm.functions.Function2, int, int, int, kotlin.jvm.internal.DefaultConstructorMarker);
+  public final void revalidate(java.lang.String, com.mapconductor.vectortile.SourceTileCache$Entry);
+  public void close();
+}
+public final class com.mapconductor.vectortile.SourceRevalidator$Companion {
+}
+public final class com.mapconductor.vectortile.SourceTileCache {
+  public static final com.mapconductor.vectortile.SourceTileCache$Companion Companion;
+  public static final long DEFAULT_MAX_AGE_MS;
+  public com.mapconductor.vectortile.SourceTileCache(java.io.File, long, long, kotlin.jvm.functions.Function0<java.lang.Long>);
+  public com.mapconductor.vectortile.SourceTileCache(java.io.File, long, long, kotlin.jvm.functions.Function0, int, kotlin.jvm.internal.DefaultConstructorMarker);
+  public final com.mapconductor.vectortile.SourceTileCache$Entry get(java.lang.String);
+  public final void put(java.lang.String, byte[], java.lang.String, java.lang.String, java.lang.Long);
+  public final void refresh(java.lang.String, java.lang.String, java.lang.String, java.lang.Long);
+  public final long getEpoch();
+  public final synchronized long bumpEpoch();
+}
+public final class com.mapconductor.vectortile.SourceTileCache$Companion {
+}
+public final class com.mapconductor.vectortile.SourceTileCache$Entry {
+  public final byte[] getBytes();
+  public final java.lang.String getEtag();
+  public final java.lang.String getLastModified();
+  public final boolean getStale();
+}
 public final class com.mapconductor.vectortile.StyleAssetCache {
   public static final com.mapconductor.vectortile.StyleAssetCache$Companion Companion;
   public com.mapconductor.vectortile.StyleAssetCache(java.io.File, long);
@@ -250,9 +298,12 @@ public final class com.mapconductor.vectortile.VectorTileProvider implements com
   public static final long DEFAULT_DISK_CACHE_BYTES;
   public static final long DEFAULT_GLYPH_CACHE_BYTES;
   public static final long DEFAULT_SPRITE_CACHE_BYTES;
+  public static final long SOURCE_GRACE_MS;
   public final com.mapconductor.vectortile.VectorTileProvider$RenderMode getRenderMode();
   public final kotlin.jvm.functions.Function0<kotlin.Unit> getOnGlyphsLoaded();
   public final void setOnGlyphsLoaded(kotlin.jvm.functions.Function0<kotlin.Unit>);
+  public final kotlin.jvm.functions.Function0<kotlin.Unit> getOnSourcesLoaded();
+  public final void setOnSourcesLoaded(kotlin.jvm.functions.Function0<kotlin.Unit>);
   public final long getGpuRenders();
   public final long getGpuFallbacks();
   public final java.util.List<java.lang.String> attributions();
@@ -265,6 +316,8 @@ public final class com.mapconductor.vectortile.VectorTileProvider implements com
   public final com.mapconductor.core.tileserver.TileProviderInterface getLabelTiles();
   public final void closeAsync();
   public void close();
+  public static final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>, int, java.io.File, long, com.mapconductor.vectortile.VectorTileProvider$RenderMode, java.lang.Integer, kotlin.jvm.functions.Function1<? super java.lang.String, byte[]>, kotlin.jvm.functions.Function1<? super java.lang.String, byte[]>, com.mapconductor.vectortile.ConditionalFetch);
+  public static final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>, int, java.io.File, long, com.mapconductor.vectortile.VectorTileProvider$RenderMode, java.lang.Integer, kotlin.jvm.functions.Function1<? super java.lang.String, byte[]>, kotlin.jvm.functions.Function1<? super java.lang.String, byte[]>);
   public static final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>, int, java.io.File, long, com.mapconductor.vectortile.VectorTileProvider$RenderMode, java.lang.Integer, kotlin.jvm.functions.Function1<? super java.lang.String, byte[]>);
   public static final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>, int, java.io.File, long, com.mapconductor.vectortile.VectorTileProvider$RenderMode, java.lang.Integer);
   public static final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>, int, java.io.File, long, com.mapconductor.vectortile.VectorTileProvider$RenderMode);
@@ -274,9 +327,11 @@ public final class com.mapconductor.vectortile.VectorTileProvider implements com
   public static final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>);
   public static final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int);
   public static final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String);
-  public com.mapconductor.vectortile.VectorTileProvider(com.mapconductor.vectortile.VectorTileRenderer, int, int, java.util.Map, kotlin.jvm.functions.Function1, int, com.mapconductor.vectortile.TileDiskCache, com.mapconductor.vectortile.StyleAssetCache, com.mapconductor.vectortile.StyleAssetCache, java.lang.String, com.mapconductor.vectortile.GpuTileRasterizer, kotlin.jvm.internal.DefaultConstructorMarker);
+  public com.mapconductor.vectortile.VectorTileProvider(com.mapconductor.vectortile.VectorTileRenderer, int, int, java.util.Map, kotlin.jvm.functions.Function1, kotlin.jvm.functions.Function1, com.mapconductor.vectortile.ConditionalFetch, com.mapconductor.vectortile.ConditionalFetch, int, com.mapconductor.vectortile.TileDiskCache, com.mapconductor.vectortile.StyleAssetCache, com.mapconductor.vectortile.StyleAssetCache, java.lang.String, com.mapconductor.vectortile.GpuTileRasterizer, kotlin.jvm.internal.DefaultConstructorMarker);
 }
 public final class com.mapconductor.vectortile.VectorTileProvider$Companion {
+  public final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>, int, java.io.File, long, com.mapconductor.vectortile.VectorTileProvider$RenderMode, java.lang.Integer, kotlin.jvm.functions.Function1<? super java.lang.String, byte[]>, kotlin.jvm.functions.Function1<? super java.lang.String, byte[]>, com.mapconductor.vectortile.ConditionalFetch);
+  public final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>, int, java.io.File, long, com.mapconductor.vectortile.VectorTileProvider$RenderMode, java.lang.Integer, kotlin.jvm.functions.Function1<? super java.lang.String, byte[]>, kotlin.jvm.functions.Function1<? super java.lang.String, byte[]>);
   public final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>, int, java.io.File, long, com.mapconductor.vectortile.VectorTileProvider$RenderMode, java.lang.Integer, kotlin.jvm.functions.Function1<? super java.lang.String, byte[]>);
   public final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>, int, java.io.File, long, com.mapconductor.vectortile.VectorTileProvider$RenderMode, java.lang.Integer);
   public final com.mapconductor.vectortile.VectorTileProvider create(java.lang.String, int, java.util.Map<java.lang.String, java.lang.String>, int, java.io.File, long, com.mapconductor.vectortile.VectorTileProvider$RenderMode);
@@ -295,6 +350,16 @@ final class com.mapconductor.vectortile.VectorTileProvider$Content extends java.
   public static com.mapconductor.vectortile.VectorTileProvider$Content valueOf(java.lang.String);
   public static kotlin.enums.EnumEntries<com.mapconductor.vectortile.VectorTileProvider$Content> getEntries();
 }
+final class com.mapconductor.vectortile.VectorTileProvider$Flight {
+  public final java.util.concurrent.CompletableFuture<com.mapconductor.vectortile.VectorTileProvider$SourceOutcome> getResult();
+  public final synchronized boolean join();
+  public final synchronized void leave();
+  public final synchronized boolean abandonIfUnwanted();
+}
+final class com.mapconductor.vectortile.VectorTileProvider$Pending {
+  public final java.util.concurrent.CompletableFuture<com.mapconductor.vectortile.VectorTileProvider$SourceOutcome> getFuture();
+  public final com.mapconductor.vectortile.VectorTileProvider$Flight getFlight();
+}
 public final class com.mapconductor.vectortile.VectorTileProvider$RenderMode extends java.lang.Enum<com.mapconductor.vectortile.VectorTileProvider$RenderMode> {
   public static final com.mapconductor.vectortile.VectorTileProvider$RenderMode CPU;
   public static final com.mapconductor.vectortile.VectorTileProvider$RenderMode GPU;
@@ -302,6 +367,10 @@ public final class com.mapconductor.vectortile.VectorTileProvider$RenderMode ext
   public static com.mapconductor.vectortile.VectorTileProvider$RenderMode[] values();
   public static com.mapconductor.vectortile.VectorTileProvider$RenderMode valueOf(java.lang.String);
   public static kotlin.enums.EnumEntries<com.mapconductor.vectortile.VectorTileProvider$RenderMode> getEntries();
+}
+final class com.mapconductor.vectortile.VectorTileProvider$SourceOutcome {
+  public final byte[] getBytes();
+  public final boolean getUnavailable();
 }
 public final class com.mapconductor.vectortile.VectorTileRasteriser implements com.mapconductor.vectorstyle.VectorStyleRasteriser {
   public com.mapconductor.vectortile.VectorTileRasteriser(java.lang.Integer, java.util.Map<java.lang.String, java.lang.String>, java.io.File, com.mapconductor.vectortile.VectorTileProvider$RenderMode, java.lang.Integer);

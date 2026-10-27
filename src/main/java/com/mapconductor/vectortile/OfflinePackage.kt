@@ -206,10 +206,46 @@ class OfflinePackage private constructor(
         private val upstream: (String) -> ByteArray?,
         @Volatile var online: Boolean = true,
         private val onStats: ((Stats) -> Unit)? = null,
+        /**
+         * How a source kept from the network is asked about once stale, while
+         * [online]. Null: kept sources are not asked about.
+         */
+        private val conditionalUpstream: ConditionalFetch? = null,
     ) : (String) -> ByteArray? {
         private val counters = Counters()
 
         val stats: Stats get() = counters.snapshot()
+
+        /**
+         * What the package holds for [url], or null -- never the network.
+         *
+         * For [VectorTileProvider]'s `localTile`: asked before anything is
+         * queued, so the package answers at once however the network is
+         * doing. Through [invoke] the package was read on the fetch threads,
+         * behind fetches that on a Wi-Fi that answers nothing each take their
+         * full timeout -- and the downloaded area stayed white with it.
+         */
+        fun local(url: String): ByteArray? {
+            val packaged = pkg.bytes(url) ?: return null
+            counters.packageHits.incrementAndGet()
+            onStats?.invoke(counters.snapshot())
+            return packaged
+        }
+
+        /**
+         * For [VectorTileProvider]'s `revalidate`: asks upstream about a kept
+         * source only while [online], and refuses otherwise. Null when no
+         * [conditionalUpstream] was given.
+         */
+        val revalidation: ConditionalFetch? =
+            conditionalUpstream?.let { upstreamFetch ->
+                ConditionalFetch { url, etag, lastModified ->
+                    if (!online) throw OfflineUnavailableException(url)
+                    counters.networkFetches.incrementAndGet()
+                    onStats?.invoke(counters.snapshot())
+                    upstreamFetch.fetch(url, etag, lastModified)
+                }
+            }
 
         override fun invoke(url: String): ByteArray? {
             val packaged = pkg.bytes(url)

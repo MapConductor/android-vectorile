@@ -139,16 +139,36 @@ class VectorTileRasteriser(
                 renderScale = options.renderScale,
             )
 
-        private fun ready(created: VectorTileProvider) {
-            // Glyphs arrive after the tiles that need them -- a range is a
-            // round trip and a low zoom wants dozens -- so tiles are drawn
-            // with what is loaded and the labels refetched once more is.
+        /**
+         * Glyphs arrive after the tiles that need them -- a range is a round
+         * trip and a low zoom wants dozens -- so tiles are drawn with what is
+         * loaded and the labels refetched once more is. Sources too, on a
+         * slow network: a tile is drawn with what has arrived, and both
+         * halves are refetched once the rest has.
+         */
+        private fun watch(created: VectorTileProvider) {
             created.onGlyphsLoaded = {
                 if (!disposed.get()) {
                     labelGeneration++
                     main.post { if (!disposed.get()) mountLabels() }
                 }
             }
+            created.onSourcesLoaded = {
+                if (!disposed.get()) {
+                    groundGeneration++
+                    labelGeneration++
+                    main.post {
+                        if (!disposed.get()) {
+                            mountGround()
+                            mountLabels()
+                        }
+                    }
+                }
+            }
+        }
+
+        private fun ready(created: VectorTileProvider) {
+            watch(created)
             host.tileServer.register("$groupId-geom", created.geometryTiles)
             host.tileServer.register("$groupId-labels", created.labelTiles)
             provider = created
@@ -184,12 +204,7 @@ class VectorTileRasteriser(
                     return@execute
                 }
                 val previous = provider
-                rebuilt.onGlyphsLoaded = {
-                    if (!disposed.get()) {
-                        labelGeneration++
-                        main.post { if (!disposed.get()) mountLabels() }
-                    }
-                }
+                watch(rebuilt)
                 // Re-registering a route replaces it, so the map never asks
                 // for an id that is not served.
                 host.tileServer.register("$groupId-geom", rebuilt.geometryTiles)
