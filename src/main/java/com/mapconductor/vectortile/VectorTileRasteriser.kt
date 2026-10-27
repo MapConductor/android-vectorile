@@ -13,6 +13,8 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
+import android.content.res.Resources
 import android.os.Handler
 import android.os.Looper
 
@@ -92,12 +94,28 @@ class VectorTileRasteriser(
         /** Resolved once, when the first provider is built; the routes are keyed on it. */
         private var tileSize = VectorTileProvider.DEFAULT_TILE_SIZE
 
+        /**
+         * The size the map is told. The dp size for a map that lays tiles
+         * out in dp, the pixel size for one that lays them out in physical
+         * pixels -- which is the provider's to say, through
+         * [RasterTilePreference.layoutInDevicePixels]. The tile URL always
+         * carries [tileSize]: that is what the provider renders at.
+         */
+        private var declaredTileSize = VectorTileProvider.DEFAULT_TILE_SIZE
+
         fun start(styleJson: String) {
             workers.execute {
+                val preference = host.serviceRegistry.get(RasterTilePreferenceKey)
                 tileSize =
                     options.tileSize
-                        ?: host.serviceRegistry.get(RasterTilePreferenceKey)?.preferredTileSize
+                        ?: preference?.preferredTileSize
                         ?: VectorTileProvider.DEFAULT_TILE_SIZE
+                declaredTileSize =
+                    if (preference?.layoutInDevicePixels == true) {
+                        (tileSize * Resources.getSystem().displayMetrics.density).roundToInt()
+                    } else {
+                        tileSize
+                    }
                 val created = runCatching { build(styleJson) }
                 if (disposed.get()) {
                     created.getOrNull()?.closeAsync()
@@ -212,7 +230,7 @@ class VectorTileRasteriser(
                     source =
                         RasterLayerSource.UrlTemplate(
                             template = host.tileServer.urlTemplate("$groupId-geom", tileSize, "g$groundGeneration"),
-                            tileSize = tileSize,
+                            tileSize = declaredTileSize,
                             maxZoom = MAX_ZOOM,
                             attributionRules = credits,
                             scheme = TileScheme.XYZ,
@@ -233,7 +251,7 @@ class VectorTileRasteriser(
                     source =
                         RasterLayerSource.UrlTemplate(
                             template = host.tileServer.urlTemplate("$groupId-labels", tileSize, "g$labelGeneration"),
-                            tileSize = tileSize,
+                            tileSize = declaredTileSize,
                             maxZoom = MAX_ZOOM,
                             // Both halves carry the credit, so hiding either
                             // one cannot silence it. `resolveMapAttributions`
