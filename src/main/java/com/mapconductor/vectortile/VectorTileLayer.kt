@@ -233,6 +233,7 @@ fun MapViewScope.VectorTileLayer(
             offlinePackage = offlinePackage,
             online = online,
             headers = headers,
+            diskCacheDir = diskCacheDir,
         )
         return
     }
@@ -506,6 +507,7 @@ private fun DirectVectorStyle(
     offlinePackage: OfflinePackage?,
     online: Boolean,
     headers: Map<String, String>,
+    diskCacheDir: File?,
 ) {
     // With a package, the map reads its tiles, glyphs and sprite from the
     // local server, which answers from the package and -- online -- fetches
@@ -519,21 +521,31 @@ private fun DirectVectorStyle(
             }
         }
     DisposableEffect(filesRoute, offlinePackage) {
+        // Online, what the package lacks is fetched upstream -- from the
+        // source cache first, and never holding a server worker for longer
+        // than a moment (see [PackageFallback]): the package's own files are
+        // served by the same workers.
+        val fallback =
+            if (filesRoute != null && offlinePackage != null && online) {
+                PackageFallback(
+                    upstreamUrl = offlinePackage::upstreamUrl,
+                    fetch = httpSourceFetch(headers),
+                    cache = diskCacheDir?.let { SourceTileCache(File(it, "sources"), SOURCE_CACHE_BYTES) },
+                )
+            } else {
+                null
+            }
         if (filesRoute != null && offlinePackage != null) {
             tileServer.registerFiles(
                 routeId = filesRoute,
                 directory = offlinePackage.directory,
-                fallback =
-                    if (online) {
-                        { relative ->
-                            offlinePackage.upstreamUrl(relative)?.let { VectorTileProvider.httpGet(it, headers) }
-                        }
-                    } else {
-                        null
-                    },
+                fallback = fallback,
             )
         }
-        onDispose { if (filesRoute != null) tileServer.unregisterFiles(filesRoute) }
+        onDispose {
+            if (filesRoute != null) tileServer.unregisterFiles(filesRoute)
+            fallback?.close()
+        }
     }
     val served =
         remember(styleJson, filesRoute) {
@@ -603,3 +615,6 @@ private fun styleAttributions(styleJson: String): List<String> =
  * two layers stacked, which costs a moment of overdraw and nothing else.
  */
 private const val HANDOVER_MS = 900L
+
+/** The direct path's source cache budget: the provider's, for the same directory. */
+private const val SOURCE_CACHE_BYTES: Long = 128L * 1024 * 1024

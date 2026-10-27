@@ -188,6 +188,18 @@ public final class com.mapconductor.vectortile.OfflinePackageDownloader$download
 public final class com.mapconductor.vectortile.OfflineUnavailableException extends java.lang.RuntimeException {
   public com.mapconductor.vectortile.OfflineUnavailableException(java.lang.String);
 }
+public final class com.mapconductor.vectortile.PackageFallback implements kotlin.jvm.functions.Function1<java.lang.String, byte[]>, java.io.Closeable {
+  public static final com.mapconductor.vectortile.PackageFallback$Companion Companion;
+  public static final long DEFAULT_WAIT_MS;
+  public static final int DEFAULT_THREADS;
+  public com.mapconductor.vectortile.PackageFallback(kotlin.jvm.functions.Function1<? super java.lang.String, java.lang.String>, com.mapconductor.vectortile.ConditionalFetch, com.mapconductor.vectortile.SourceTileCache, long, int);
+  public com.mapconductor.vectortile.PackageFallback(kotlin.jvm.functions.Function1, com.mapconductor.vectortile.ConditionalFetch, com.mapconductor.vectortile.SourceTileCache, long, int, int, kotlin.jvm.internal.DefaultConstructorMarker);
+  public byte[] invoke(java.lang.String);
+  public void close();
+  public java.lang.Object invoke(java.lang.Object);
+}
+public final class com.mapconductor.vectortile.PackageFallback$Companion {
+}
 public final class com.mapconductor.vectortile.SolidBatchRenderer implements java.io.Closeable {
   public static final com.mapconductor.vectortile.SolidBatchRenderer$Companion Companion;
   public static final int VERTEX_STRIDE;
